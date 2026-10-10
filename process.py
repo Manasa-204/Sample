@@ -1,3 +1,7 @@
+import os
+import time
+import subprocess
+import threading
 import pandas as pd
 import ollama
 from tqdm import tqdm
@@ -13,19 +17,38 @@ MODEL = "qwen2.5:7b"
 
 QUESTION_COLUMN = "Employee_Questions"
 
-# Save the Excel file after every 100 questions
-SAVE_EVERY = 100
+# Save the Excel file after every 50 questions
+SAVE_EVERY = 50
+
+# Target maximum GPU temperature (C) - runs at full speed and throttles only near 83C
+MAX_GPU_TEMP = 83
+current_gpu_temp = 60
+
+def _monitor_gpu_temp():
+    global current_gpu_temp
+    while True:
+        try:
+            out = subprocess.check_output(
+                ["nvidia-smi", "--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"],
+                creationflags=subprocess.CREATE_NO_WINDOW
+            ).decode().strip()
+            current_gpu_temp = int(out.splitlines()[0])
+        except Exception:
+            pass
+        time.sleep(2.0)
+
+threading.Thread(target=_monitor_gpu_temp, daemon=True).start()
 
 # ============================================================
 # LOAD EXCEL
 # ============================================================
 
-print("Loading Excel file...")
-
-df = pd.read_excel(
-    INPUT_FILE,
-    sheet_name=0
-)
+if os.path.exists(OUTPUT_FILE):
+    print(f"Resuming from existing output file: {OUTPUT_FILE}...")
+    df = pd.read_excel(OUTPUT_FILE, sheet_name=0)
+else:
+    print(f"Loading input file: {INPUT_FILE}...")
+    df = pd.read_excel(INPUT_FILE, sheet_name=0)
 
 print(f"Loaded {len(df)} rows.")
 print(f"Using column: {QUESTION_COLUMN}")
@@ -42,6 +65,10 @@ if "Qwen_Status" not in df.columns:
 
 if "Qwen_Error" not in df.columns:
     df["Qwen_Error"] = ""
+
+df["Qwen_Ollama_Answers"] = df["Qwen_Ollama_Answers"].astype(object)
+df["Qwen_Status"] = df["Qwen_Status"].astype(object)
+df["Qwen_Error"] = df["Qwen_Error"].astype(object)
 
 # ============================================================
 # PROCESS QUESTIONS
@@ -113,7 +140,8 @@ Give only the answer to the employee's question.
                 }
             ],
             options={
-                "temperature": 0
+                "temperature": 0,
+                "num_gpu": 99
             }
         )
 
@@ -129,6 +157,16 @@ Give only the answer to the employee's question.
         df.at[index, "Qwen_Error"] = str(e)
 
     # --------------------------------------------------------
+    # DYNAMIC THERMAL GUARD (KEEPS GPU <= 83C AT FULL SPEED)
+    # --------------------------------------------------------
+    if current_gpu_temp >= MAX_GPU_TEMP:
+        time.sleep(0.35)
+    elif current_gpu_temp >= MAX_GPU_TEMP - 2:
+        time.sleep(0.15)
+    else:
+        time.sleep(0.05)
+
+    # --------------------------------------------------------
     # SAVE CHECKPOINT
     # --------------------------------------------------------
 
@@ -136,11 +174,13 @@ Give only the answer to the employee's question.
 
         print(f"\nSaving checkpoint at row {index + 1}...")
 
+        temp_file = OUTPUT_FILE + ".tmp.xlsx"
         df.to_excel(
-            OUTPUT_FILE,
+            temp_file,
             index=False,
             engine="openpyxl"
         )
+        os.replace(temp_file, OUTPUT_FILE)
 
 # ============================================================
 # FINAL SAVE
@@ -148,11 +188,13 @@ Give only the answer to the employee's question.
 
 print("\nSaving final Excel file...")
 
+temp_file = OUTPUT_FILE + ".tmp.xlsx"
 df.to_excel(
-    OUTPUT_FILE,
+    temp_file,
     index=False,
     engine="openpyxl"
 )
+os.replace(temp_file, OUTPUT_FILE)
 
 # ============================================================
 # SUMMARY
